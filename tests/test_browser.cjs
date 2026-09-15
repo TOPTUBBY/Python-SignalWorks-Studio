@@ -40,7 +40,7 @@ let browser;
   const box=e=>{const r=e.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,bottom:r.bottom};};
   return {legends:['.legend','.legend2'].map(selector=>({box:box(document.querySelector(selector)),
    rows:[...new Set([...document.querySelectorAll(selector+' .traces')].map(e=>Math.round(e.getBoundingClientRect().y)))],
-   texts:[...document.querySelectorAll(selector+' .legendtext')].map(e=>e.textContent)})),
+   texts:[...document.querySelectorAll(selector+' .traces text')].map(e=>e.textContent)})),
    plot:box(document.getElementById('interactivePlot'))};
  });
  assert(geometry.legends[0].box.bottom < geometry.legends[1].box.y,'Legends overlap');
@@ -75,7 +75,7 @@ let browser;
  await context.request.post('http://127.0.0.1:8800/update/1',{form:{selected_8:'on',axis_8:'right'}});
  await open(1);
  assert.equal(await page.locator('.legend2 .legend2titletext').textContent(),'SECONDARY');
- assert.equal(await page.locator('.legend2 .legendtext').textContent(),names[8]);
+ assert.equal(await page.locator('.legend2 .traces text').textContent(),names[8]);
  assert.deepEqual(errors,[]);
  console.log('PASS: browser legend routing/rows/geometry, full signal names, responsive controls, theme, zoom/visibility restoration and Secondary-only page');
 })().catch(e=>{console.error(e);process.exitCode=1;}).finally(async()=>{if(browser)await browser.close();server.kill();});
