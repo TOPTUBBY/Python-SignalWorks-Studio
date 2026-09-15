@@ -34,6 +34,16 @@
 #
 # Changelog
 # ------------------------------------------------------------------------------
+# V4.4.5 GitHub issue hotfix                                           2026-09-15
+# Fixed / Improved:
+#   - Parse dd.MM.yyyy HH:mm:ss[.fff] timestamps explicitly (Issue #2).
+#   - Keep legends to a maximum of three rows by expanding columns horizontally.
+#   - Preserve zoom/pan, drag mode and legend visibility when switching plot pages.
+#   - Apply the saved interactive view to PNG/PDF/Word static exports.
+#   - Add per-signal line-style selection (Auto/Solid/Dash/Dot/Dash-dot/Long dash).
+#   - Improve contrast/readability of Dark mode surfaces and form controls.
+#   - Add a dependency-free DOCX fallback when python-docx is unavailable (Issue #1).
+#
 # V4.4.5                                                               2026-09-03
 # Added:
 #   - Multi-file CSV selection from the browser file picker.
@@ -242,8 +252,10 @@ import math
 import os
 import re
 import socket
+import struct
 import sys
 import threading
+import zipfile
 import textwrap
 import time
 import uuid
@@ -353,12 +365,16 @@ class TabState:
     axis_assignments: Dict[str, str] = field(default_factory=dict)
     # Manual color overrides only. Missing signal => automatic palette color.
     color_assignments: Dict[str, str] = field(default_factory=dict)
+    # Optional per-signal line style. Missing/"auto" keeps the axis default style.
+    line_style_assignments: Dict[str, str] = field(default_factory=dict)
     # V4.4 engineering markup. Reference/range items are portable preset data.
     # Comments are intentionally session-specific unless a future format opts in.
     reference_lines: List[dict] = field(default_factory=list)
     range_bands: List[dict] = field(default_factory=list)
     comments: List[dict] = field(default_factory=list)
     revision: int = 0
+    # Reset/preset replacement creates a fresh view; styling alone keeps zoom.
+    view_token: str = field(default_factory=lambda: uuid.uuid4().hex[:16])
 
 
 @dataclass
@@ -392,6 +408,8 @@ class BrowserSession:
     bound_source_rows: List[int] = field(default_factory=list)
     bound_total_rows: int = 0
     loaded_source_files: List[str] = field(default_factory=list)
+    # Changes whenever a CSV/bound dataset is loaded; scopes browser view persistence.
+    dataset_token: str = ""
 
 
 # ------------------------------------------------------------------------------
@@ -676,11 +694,25 @@ def _auto_color_for_position(axis_target: str, primary_index: int, secondary_ind
     return PRIMARY_LINE_COLORS[primary_index % len(PRIMARY_LINE_COLORS)]
 
 
+SIGNAL_LINE_STYLES = ("solid", "dash", "dot", "dashdot", "longdash")
+
+
 def _effective_signal_color(ts: TabState, header: str, axis_target: str, primary_index: int, secondary_index: int) -> str:
     manual = ts.color_assignments.get(header, "")
     if _valid_hex_color(manual):
         return manual
     return _auto_color_for_position(axis_target, primary_index, secondary_index)
+
+
+def _effective_signal_dash(ts: TabState, header: str, axis_target: str, secondary_index: int) -> str:
+    # Missing/auto keeps the original Primary solid / Secondary patterned behavior.
+    manual = str(ts.line_style_assignments.get(header, "auto") or "auto").lower()
+    if manual in SIGNAL_LINE_STYLES:
+        return manual
+    if axis_target == "right":
+        defaults = ("dash", "dot", "dashdot", "longdash")
+        return defaults[secondary_index % len(defaults)]
+    return "solid"
 
 
 def _generic_tab_state(tab_id: int, revision: int = 0) -> TabState:
@@ -941,11 +973,12 @@ def apply_loaded_preset(state: BrowserSession) -> Tuple[int, int]:
             signals = []
         for entry in signals:
             if isinstance(entry, str):
-                name, axis, color = entry, "left", None
+                name, axis, color, line_style = entry, "left", None, "auto"
             elif isinstance(entry, dict):
                 name = str(entry.get("name", "")).strip()
                 axis = str(entry.get("axis", "left")).lower()
                 color = entry.get("color")
+                line_style = str(entry.get("line_style", entry.get("dash", "auto")) or "auto").lower()
             else:
                 continue
             if not name:
@@ -957,6 +990,8 @@ def apply_loaded_preset(state: BrowserSession) -> Tuple[int, int]:
             ts.axis_assignments[name] = "right" if axis in ("right", "secondary", "y2") else "left"
             if color and _valid_hex_color(str(color)):
                 ts.color_assignments[name] = str(color).upper()
+            if line_style in SIGNAL_LINE_STYLES:
+                ts.line_style_assignments[name] = line_style
             matched_total += 1
 
         new_tabs.append(ts)
@@ -994,6 +1029,8 @@ def build_preset_payload_from_state(state: BrowserSession, preset_name: Optional
                 "axis": axis,
                 # null means use automatic palette when the preset is imported.
                 "color": ts.color_assignments.get(signal) if _valid_hex_color(ts.color_assignments.get(signal, "")) else None,
+                # "auto" preserves legacy Primary solid / Secondary patterned defaults.
+                "line_style": ts.line_style_assignments.get(signal, "auto"),
             })
         tabs.append({
             "name": f"Tab{tab_id + 1}",
@@ -1015,7 +1052,7 @@ def build_preset_payload_from_state(state: BrowserSession, preset_name: Optional
         "name": preset_name or state.preset_name or "Signal Preset",
         "created_by": APP_TITLE,
         "app_version": APP_VERSION,
-        "description": "Portable signal, axis, color, reference-line and range-band preset. No CSV data or test-specific comments are stored.",
+        "description": "Portable signal, axis, color, line-style, reference-line and range-band preset. No CSV data or test-specific comments are stored.",
         "tabs": tabs,
     }
 
@@ -1116,23 +1153,52 @@ def _best_datetime_conversion(df: pd.DataFrame, timestamp_col_name: str) -> Tupl
             source = df[timestamp_col_name].astype(str).str.strip() + " " + df[second_name].astype(str).str.strip()
             source_description = f"{timestamp_col_name} + {second_name}"
 
+    # Prefer an explicit day-first parser for dotted European logger dates.
+    # This avoids pandas/locale inference treating e.g. 01.09.2026 as Jan 9.
+    source_text = source.astype(str).str.strip()
+    dotted_mask = source_text.str.match(
+        r"^\d{1,2}\.\d{1,2}\.\d{4}[ _]\d{1,2}:\d{2}:\d{2}(?:\.\d+)?$",
+        na=False,
+    )
+    # Explicit formats work on pandas 1.5 too (format="mixed" requires 2.x).
+    # Combine whole/fractional seconds, and never let fallback inference replace
+    # a dotted date, even when an invalid row is present in the same file.
+    dotted_source = source_text.where(dotted_mask).str.replace("_", " ", regex=False)
+    dotted_conv = pd.to_datetime(dotted_source, format="%d.%m.%Y %H:%M:%S", errors="coerce")
+    dotted_conv = dotted_conv.fillna(pd.to_datetime(
+        dotted_source, format="%d.%m.%Y %H:%M:%S.%f", errors="coerce"))
+    best_conv = dotted_conv if bool(dotted_mask.any()) else None
+    best_count = int(dotted_conv.notna().sum())
+
     formats = (
         "%Y-%m-%d_%H-%M-%S",
+        "%Y-%m-%d_%H:%M:%S",
         "%d/%m/%Y_%H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y_%H:%M:%S",
+        "%d.%m.%Y %H:%M:%S.%f",
+        "%d.%m.%Y_%H:%M:%S.%f",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
         "%Y/%m/%d %H:%M:%S",
         "%m/%d/%Y %H:%M:%S",
         None,
     )
-    best_conv = None
-    best_count = 0
+    target_count = int(source.notna().sum())
     for fmt in formats:
         try:
+            # If the explicit dotted day-first parser already covered every non-null
+            # sample, do not fall through to pandas locale inference.
+            if fmt is None and best_count >= target_count:
+                continue
             if fmt is None:
-                conv = pd.to_datetime(source, errors="coerce")
+                conv = pd.to_datetime(source.where(~dotted_mask), errors="coerce")
             else:
                 conv = pd.to_datetime(source, format=fmt, errors="coerce")
+            if bool(dotted_mask.any()):
+                conv = conv.copy()
+                conv.loc[dotted_mask] = dotted_conv.loc[dotted_mask]
         except Exception:
             continue
         cnt = int(conv.notna().sum())
@@ -1419,6 +1485,7 @@ def load_csv_payload_into_state(
     state.header_marker = header_marker
     state.delimiter = delimiter
     state.loaded_source_files = list(source_files or [state.filename])
+    state.dataset_token = uuid.uuid4().hex[:16]
     state.plot_cache.clear()
 
     if state.loaded_preset:
@@ -1867,12 +1934,11 @@ def apply_axis_visual_style(ax_left, ax_right=None) -> None:
         ax_right.spines["right"].set_linewidth(1.8)
 
 
-def compact_legend_ncol(item_count: int) -> int:
-    if item_count <= 2:
+def compact_legend_ncol(item_count: int, max_rows: int = 3) -> int:
+    # Expand columns horizontally so the legend never needs more than max_rows rows.
+    if item_count <= 0:
         return 1
-    if item_count <= 4:
-        return 2
-    return 3
+    return max(1, int(math.ceil(item_count / max(1, int(max_rows)))))
 
 
 def create_separate_axis_legends(ax_left, ax_right=None):
@@ -1930,6 +1996,21 @@ def create_separate_axis_legends(ax_left, ax_right=None):
         legend_right.get_frame().set_edgecolor(SECONDARY_AXIS_COLOR)
         legend_right.get_frame().set_linewidth(1.2)
 
+    # Fit both legend boxes within the plot width, including long signal names.
+    # The row count stays fixed; reduce text size only when columns need space.
+    legends = [item for item in (legend_left, legend_right) if item is not None]
+    if legends:
+        fig = ax_left.figure
+        renderer = fig.canvas.get_renderer()
+        for _ in range(4):
+            available = ax_left.get_window_extent(renderer).width * 0.96
+            occupied = sum(item.get_window_extent(renderer).width for item in legends)
+            if occupied <= available:
+                break
+            scale = min(0.95, available / occupied)
+            for item in legends:
+                for text in [item.get_title(), *item.get_texts()]:
+                    text.set_fontsize(text.get_fontsize() * scale)
     return legend_left, legend_right
 
 
@@ -2057,7 +2138,7 @@ def apply_engineering_annotations_mpl(state: BrowserSession, ts: TabState, ax_le
         )
 
 
-def build_figure(state: BrowserSession, tab_id: int, report_header: bool = False, figsize=None):
+def build_figure(state: BrowserSession, tab_id: int, report_header: bool = False, figsize=None, view_state: Optional[dict] = None):
     if state.df is None:
         raise ValueError("No CSV loaded.")
     if not (0 <= tab_id < len(TAB_PRESETS)):
@@ -2111,33 +2192,41 @@ def build_figure(state: BrowserSession, tab_id: int, report_header: bool = False
     primary_index = 0
     secondary_index = 0
 
+    visible_signals = {}
+    if isinstance(view_state, dict) and isinstance(view_state.get("visible_signals"), dict):
+        visible_signals = {str(k): bool(v) for k, v in view_state.get("visible_signals", {}).items()}
+
     for header, series, axis_target in plot_items:
+        is_visible = visible_signals.get(header, True)
         if axis_target == "right" and ax_right is not None:
             color = _effective_signal_color(ts, header, axis_target, primary_index, secondary_index)
-            line, = ax_right.plot(
-                x_vals,
-                series,
-                linestyle="--",
-                linewidth=1.6,
-                color=color,
-                alpha=0.95,
-                label=header,
-                zorder=3,
-            )
-            line.set_dashes(SECONDARY_DASH_PATTERNS[secondary_index % len(SECONDARY_DASH_PATTERNS)])
+            dash_name = _effective_signal_dash(ts, header, axis_target, secondary_index)
+            if is_visible:
+                ax_right.plot(
+                    x_vals,
+                    series,
+                    linestyle=_mpl_dash_style(dash_name),
+                    linewidth=1.6,
+                    color=color,
+                    alpha=0.95,
+                    label=header,
+                    zorder=3,
+                )
             secondary_index += 1
         else:
             color = _effective_signal_color(ts, header, axis_target, primary_index, secondary_index)
-            ax_left.plot(
-                x_vals,
-                series,
-                linestyle="-",
-                linewidth=1.6,
-                label=header,
-                color=color,
-                alpha=0.95,
-                zorder=2,
-            )
+            dash_name = _effective_signal_dash(ts, header, axis_target, secondary_index)
+            if is_visible:
+                ax_left.plot(
+                    x_vals,
+                    series,
+                    linestyle=_mpl_dash_style(dash_name),
+                    linewidth=1.6,
+                    label=header,
+                    color=color,
+                    alpha=0.95,
+                    zorder=2,
+                )
             primary_index += 1
 
     if ts.auto_title and ts.selected_signals:
@@ -2175,6 +2264,31 @@ def build_figure(state: BrowserSession, tab_id: int, report_header: bool = False
             if right_step <= 0:
                 raise ValueError("Right Tick Step must be greater than 0.")
             ax_right.yaxis.set_major_locator(MultipleLocator(right_step))
+
+    # Apply the current browser view to static exports when supplied.
+    if isinstance(view_state, dict):
+        try:
+            xr = view_state.get("xaxis_range")
+            if isinstance(xr, list) and len(xr) == 2:
+                if is_datetime_index:
+                    ax_left.set_xlim(pd.to_datetime(xr[0]), pd.to_datetime(xr[1]))
+                else:
+                    ax_left.set_xlim(float(xr[0]), float(xr[1]))
+        except Exception:
+            pass
+        try:
+            yr = view_state.get("yaxis_range")
+            if isinstance(yr, list) and len(yr) == 2:
+                ax_left.set_ylim(float(yr[0]), float(yr[1]))
+        except Exception:
+            pass
+        if ax_right is not None:
+            try:
+                yr2 = view_state.get("yaxis2_range")
+                if isinstance(yr2, list) and len(yr2) == 2:
+                    ax_right.set_ylim(float(yr2[0]), float(yr2[1]))
+            except Exception:
+                pass
 
     apply_engineering_annotations_mpl(state, ts, ax_left, ax_right)
 
@@ -2244,13 +2358,15 @@ def add_report_header(fig) -> None:
     fig.add_artist(line)
 
 
-def render_plot_png(state: BrowserSession, tab_id: int, dpi: int = 150, use_cache: bool = True) -> bytes:
+def render_plot_png(state: BrowserSession, tab_id: int, dpi: int = 150, use_cache: bool = True, view_state: Optional[dict] = None) -> bytes:
     ts = state.tabs[tab_id]
     cached = state.plot_cache.get(tab_id)
+    if view_state is not None:
+        use_cache = False
     if use_cache and cached is not None and cached[0] == ts.revision:
         return cached[1]
 
-    fig = build_figure(state, tab_id)
+    fig = build_figure(state, tab_id, view_state=view_state)
     stream = io.BytesIO()
     try:
         fig.savefig(stream, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.08)
@@ -2295,14 +2411,12 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
     secondary_index = 0
     primary_group_title_added = False
     secondary_group_title_added = False
-    secondary_dash_names = ["dash", "dot", "dashdot", "longdash"]
-
     for header, series, axis_target in plot_items:
         y_vals = [None if pd.isna(v) else float(v) for v in series]
 
         if axis_target == "right":
             color = _effective_signal_color(ts, header, axis_target, primary_index, secondary_index)
-            dash = secondary_dash_names[secondary_index % len(secondary_dash_names)]
+            dash = _effective_signal_dash(ts, header, axis_target, secondary_index)
             fig.add_trace(go.Scattergl(
                 x=x_vals,
                 y=y_vals,
@@ -2321,6 +2435,7 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
             secondary_index += 1
         else:
             color = _effective_signal_color(ts, header, axis_target, primary_index, secondary_index)
+            dash = _effective_signal_dash(ts, header, axis_target, secondary_index)
             fig.add_trace(go.Scattergl(
                 x=x_vals,
                 y=y_vals,
@@ -2332,7 +2447,7 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
                     {"text": "PRIMARY"}
                     if not primary_group_title_added else None
                 ),
-                line={"color": color, "width": 1.8, "dash": "solid"},
+                line={"color": color, "width": 1.8, "dash": dash},
                 hovertemplate="%{x}<br>" + header + ": %{y:.4g}<extra>Primary</extra>",
             ))
             primary_group_title_added = True
@@ -2485,6 +2600,10 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
         engineering_annotations.append(comment_ann)
         engineering_annotation_map.append({"kind": "comment", "id": str(comment.get("id", ""))})
 
+    # Keep the horizontal legend to at most three rows by adding columns as needed.
+    legend_columns = max(1, int(math.ceil(max(1, len(plot_items)) / 3.0)))
+    legend_entry_fraction = 1.0 / legend_columns
+
     fig.update_layout(
         title={"text": title_text, "x": 0.5, "xanchor": "center", "font": {"size": 18}},
         xaxis=xaxis,
@@ -2499,6 +2618,7 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
         dragmode="zoom",
         legend={
             "orientation": "h",
+            "traceorder": "normal",
             "yanchor": "top",
             "y": -0.20,
             "xanchor": "left",
@@ -2509,6 +2629,8 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
             "bgcolor": "rgba(255,255,255,0.88)",
             "bordercolor": "#e5e7eb",
             "borderwidth": 1,
+            "entrywidthmode": "fraction",
+            "entrywidth": legend_entry_fraction,
         },
         shapes=engineering_shapes,
         annotations=engineering_annotations,
@@ -2602,6 +2724,14 @@ def render_signal_rows(state: BrowserSession, tab_id: int) -> str:
         shown_color = manual_color if is_manual else auto_color
         color_mode = "manual" if is_manual else "auto"
         auto_class = "" if is_manual else " auto"
+        line_style = str(ts.line_style_assignments.get(signal, "auto") or "auto").lower()
+        if line_style not in SIGNAL_LINE_STYLES:
+            line_style = "auto"
+        line_style_options = [("auto", "Auto"), ("solid", "Solid"), ("dash", "Dash"), ("dot", "Dot"), ("dashdot", "Dash-dot"), ("longdash", "Long dash")]
+        line_style_html = "".join(
+            f'<option value="{value}" {"selected" if line_style == value else ""}>{label}</option>'
+            for value, label in line_style_options
+        )
 
         rows.append(
             f"""
@@ -2615,6 +2745,7 @@ def render_signal_rows(state: BrowserSession, tab_id: int) -> str:
                     <option value="left" {left_selected}>Primary</option>
                     <option value="right" {right_selected}>Secondary</option>
                 </select>
+                <select name="line_style_{idx}" class="line-style-select" title="Signal line style. Auto keeps the default style for the selected axis.">{line_style_html}</select>
                 <div class="color-control{auto_class}" title="Signal color. Click the color to set manually, or A to return to automatic color.">
                     <input type="hidden" class="color-mode" name="color_mode_{idx}" value="{color_mode}">
                     <input type="color" class="signal-color" name="color_{idx}" value="{esc(shown_color)}" data-auto-primary="{PRIMARY_LINE_COLORS[idx % len(PRIMARY_LINE_COLORS)]}" data-auto-secondary="{SECONDARY_LINE_COLORS[idx % len(SECONDARY_LINE_COLORS)]}" oninput="setManualColor(this)">
@@ -2856,7 +2987,7 @@ def render_active_tab(state: BrowserSession, tab_id: int) -> str:
                         <button class="btn compact" type="button" onclick="resetInteractiveView()">Reset view</button>
                         <button class="btn compact" type="button" onclick="autoscaleInteractiveView()">Autoscale</button>
                         <button class="btn compact" type="button" onclick="showAllInteractiveSignals()">Show all</button>
-                        <a class="btn compact" href="{image_src}" target="_blank">Static PNG</a>
+                        <a class="btn compact" href="{image_src}" target="_blank" onclick="setStaticPlotHref(this)">Static PNG</a>
                     </div>
                 </div>
                 <div class="interactive-plot-wrap">
@@ -3217,7 +3348,7 @@ details.collapsible[open] summary::after { transform:rotate(180deg); }
 .secondary-text-btn { color:var(--secondary-axis); }
 .signal-list { border:1px solid var(--line); border-radius:9px; max-height:min(390px,42vh); overflow-y:auto; overscroll-behavior:auto; background:#fff; }
 .signal-row {
-    display:grid; grid-template-columns:minmax(0,1fr) 118px 58px; gap:7px; align-items:center;
+    display:grid; grid-template-columns:minmax(0,1fr) 96px 88px 58px; gap:6px; align-items:center;
     min-height:36px; padding:5px 7px; border-bottom:1px solid #f0f1f3; border-left:2px solid transparent;
 }
 .signal-row:last-child { border-bottom:0; }
@@ -3231,7 +3362,7 @@ details.collapsible[open] summary::after { transform:rotate(180deg); }
     white-space:nowrap; color:#344054; font-weight:500;
 }
 .signal-row:hover .signal-name { color:#101828; }
-.axis-select { padding:5px 6px; border-radius:6px; font-size:10px; min-width:0; }
+.axis-select, .line-style-select { padding:5px 6px; border-radius:6px; font-size:10px; min-width:0; }
 .color-control { display:flex; align-items:center; gap:3px; justify-content:flex-end; }
 .signal-color { width:30px; height:25px; padding:1px; border:1px solid var(--line-strong); border-radius:6px; background:#fff; cursor:pointer; }
 .color-control.auto .signal-color { opacity:.72; }
@@ -3352,35 +3483,35 @@ html[data-theme="dark"] .theme-switch-icon.moon {color:#b9d0da}
 
 html[data-theme="dark"] {
     color-scheme:dark;
-    --bg:#0e1116;
-    --surface:#171b22;
-    --surface-soft:#1d222b;
-    --text:#e7ebf1;
-    --muted:#a3adbd;
-    --subtle:#7f8a9b;
-    --line:#2b313c;
-    --line-strong:#3a4351;
-    --accent:#4aa3df;
-    --accent-hover:#66b5ea;
-    --primary-axis:#69b7ea;
-    --secondary-axis:#ff826f;
-    --success:#58d68d;
-    --warning:#f6b85a;
-    --error:#ff7b72;
-    --shadow:0 1px 2px rgba(0,0,0,.32),0 1px 4px rgba(0,0,0,.22);
+    --bg:#171c23;
+    --surface:#202730;
+    --surface-soft:#29323d;
+    --text:#eef2f7;
+    --muted:#bac4d0;
+    --subtle:#96a2b2;
+    --line:#3a4654;
+    --line-strong:#4c5b6c;
+    --accent:#58afe7;
+    --accent-hover:#78c0ed;
+    --primary-axis:#79c3ef;
+    --secondary-axis:#ff9484;
+    --success:#6cdda0;
+    --warning:#f8c772;
+    --error:#ff9388;
+    --shadow:0 1px 2px rgba(0,0,0,.24),0 1px 4px rgba(0,0,0,.18);
 }
-html[data-theme="dark"] .app-header { background:rgba(17,20,26,.96); }
+html[data-theme="dark"] .app-header { background:rgba(29,35,44,.96); }
 html[data-theme="dark"] .brand-mark { background:linear-gradient(145deg,#142638,#192f44); border-color:#29445d; color:#75bdec; box-shadow:none; }
 html[data-theme="dark"] input[type="text"],
 html[data-theme="dark"] input[type="search"],
 html[data-theme="dark"] input[type="number"],
 html[data-theme="dark"] input[type="file"],
-html[data-theme="dark"] select { background:#13171d; color:var(--text); border-color:var(--line-strong); }
-html[data-theme="dark"] .header-tools input[type="file"]::file-selector-button { background:#222833; color:#d8dee9; border-color:var(--line); }
+html[data-theme="dark"] select { background:#252d38; color:var(--text); border-color:var(--line-strong); }
+html[data-theme="dark"] .header-tools input[type="file"]::file-selector-button { background:#303946; color:#e4e9ef; border-color:var(--line); }
 html[data-theme="dark"] .file-picker::file-selector-button { background:#17334a !important; color:#82c7f3 !important; }
 html[data-theme="dark"] .preset-file::file-selector-button { background:#2c2445 !important; color:#c4b5fd !important; }
-html[data-theme="dark"] .btn { background:#1b2028; color:#d7dde7; border-color:var(--line-strong); }
-html[data-theme="dark"] .btn:hover { background:#242a34; border-color:#536071; }
+html[data-theme="dark"] .btn { background:#29323d; color:#e4e9ef; border-color:var(--line-strong); }
+html[data-theme="dark"] .btn:hover { background:#343e4b; border-color:#627286; }
 html[data-theme="dark"] .btn.primary { background:#176ca8; color:#fff; border-color:#2d83bd; }
 html[data-theme="dark"] .preset-mode-badge { background:#1b2028; border-color:var(--line); color:#b7c0cc; }
 html[data-theme="dark"] .preset-mode-badge.active { background:#14281e; border-color:#285d40; color:#77d49a; }
@@ -3397,7 +3528,7 @@ html[data-theme="dark"] .interactive-plot-wrap,
 html[data-theme="dark"] .analysis-metric,
 html[data-theme="dark"] .cycle-metric,
 html[data-theme="dark"] .empty-state { background:var(--surface); border-color:var(--line); }
-html[data-theme="dark"] .signal-row { border-bottom-color:#252b34; }
+html[data-theme="dark"] .signal-row { border-bottom-color:#394452; }
 html[data-theme="dark"] .signal-row:hover,
 html[data-theme="dark"] .stats-table tr:hover td,
 html[data-theme="dark"] .cursor-instruction,
@@ -3412,9 +3543,9 @@ html[data-theme="dark"] .text-btn:hover { color:#e6ebf2; }
 html[data-theme="dark"] .signal-color,
 html[data-theme="dark"] .auto-color-btn,
 html[data-theme="dark"] .cycle-controls select,
-html[data-theme="dark"] .cycle-controls input { background:#13171d; color:var(--text); border-color:var(--line-strong); }
-html[data-theme="dark"] .stats-table th { background:#20252e; color:#b3bdca; }
-html[data-theme="dark"] .stats-table td { border-bottom-color:#252b34; }
+html[data-theme="dark"] .cycle-controls input { background:#252d38; color:var(--text); border-color:var(--line-strong); }
+html[data-theme="dark"] .stats-table th { background:#303946; color:#c6d0dc; }
+html[data-theme="dark"] .stats-table td { border-bottom-color:#394452; }
 html[data-theme="dark"] .axis-pill.primary { background:#162a39; }
 html[data-theme="dark"] .axis-pill.secondary { background:#39201d; }
 html[data-theme="dark"] .empty-icon { background:#17334a; color:#82c7f3; }
@@ -3568,7 +3699,7 @@ html[data-theme="dark"] .comment-add-btn { background:#172f46 !important; color:
     .report-actions .btn { flex:1; }
     .header-menu { width:auto; }
     .menu-panel, .menu-panel.wide { min-width:min(310px, calc(100vw - 28px)); }
-    .signal-row { grid-template-columns:minmax(0,1fr) 104px 54px; }
+    .signal-row { grid-template-columns:minmax(0,1fr) 82px 82px 52px; }
     .preset-badge { display:none !important; }
     .analysis-metrics { grid-template-columns:1fr; }
     .cycle-metrics { grid-template-columns:1fr 1fr; }
@@ -3581,8 +3712,11 @@ const ACTIVE_TAB = __ACTIVE_TAB__;
 const ACTIVE_REVISION = __REVISION__;
 const EXPORT_BASE = __EXPORT_BASE_JSON__;
 const ACTIVE_PRESET_NAME = __PRESET_NAME_JSON__;
+const DATASET_TOKEN = __DATASET_TOKEN_JSON__;
+const TAB_VIEW_TOKENS = __TAB_VIEW_TOKENS_JSON__;
 const THEME_SESSION_KEY = 'signalworks_studio_theme_session_mode';
 let interactiveOriginalLayout = null;
+let interactiveViewReady = false;
 
 // V4.4.5 multi-file CSV selection/binding state.
 let selectedCsvFiles = [];
@@ -3877,13 +4011,13 @@ function updateThemeToggleUI(mode) {
 function plotThemeUpdate() {
     const dark = document.documentElement.dataset.theme === 'dark';
     return {
-        'paper_bgcolor': dark ? '#171b22' : '#ffffff', 'plot_bgcolor': dark ? '#171b22' : '#ffffff',
-        'font.color': dark ? '#d9e0ea' : '#344054', 'title.font.color': dark ? '#eef2f7' : '#172033',
-        'xaxis.gridcolor': dark ? '#333b47' : '#e5e9ee', 'xaxis.linecolor': dark ? '#6d7787' : '#555f6b',
-        'xaxis.zerolinecolor': dark ? '#46505e' : '#c8ced6', 'xaxis.spikecolor': dark ? '#909aa8' : '#8b95a1',
-        'yaxis.gridcolor': dark ? '#333b47' : '#dfe4ea', 'yaxis.zerolinecolor': dark ? '#46505e' : '#c8ced6',
-        'legend.bgcolor': dark ? 'rgba(23,27,34,0.92)' : 'rgba(255,255,255,0.88)',
-        'legend.bordercolor': dark ? '#343b46' : '#e5e7eb'
+        'paper_bgcolor': dark ? '#202730' : '#ffffff', 'plot_bgcolor': dark ? '#202730' : '#ffffff',
+        'font.color': dark ? '#e6ebf2' : '#344054', 'title.font.color': dark ? '#f4f7fa' : '#172033',
+        'xaxis.gridcolor': dark ? '#46515f' : '#e5e9ee', 'xaxis.linecolor': dark ? '#8390a0' : '#555f6b',
+        'xaxis.zerolinecolor': dark ? '#586575' : '#c8ced6', 'xaxis.spikecolor': dark ? '#aeb8c5' : '#8b95a1',
+        'yaxis.gridcolor': dark ? '#46515f' : '#dfe4ea', 'yaxis.zerolinecolor': dark ? '#586575' : '#c8ced6',
+        'legend.bgcolor': dark ? 'rgba(41,50,61,0.94)' : 'rgba(255,255,255,0.88)',
+        'legend.bordercolor': dark ? '#526071' : '#e5e7eb'
     };
 }
 function applyThemeToPlot() {
@@ -4510,13 +4644,15 @@ async function confirmExportDialog() {
     try {
         let blob;
         if (ctx.mode === 'report') {
-            const url = `${ctx.endpoint}?tabs=${encodeURIComponent(tabs.join(','))}`;
+            const views = exportViewStates(tabs);
+            const url = `${ctx.endpoint}?tabs=${encodeURIComponent(tabs.join(','))}&views=${encodeURIComponent(JSON.stringify(views))}`;
             blob = await fetchExportBlob(url);
         } else if (ctx.mode === 'preset') {
             const presetName = String(presetNameEl?.value || 'Signal Preset').trim() || 'Signal Preset';
             blob = await fetchExportBlob(`/preset/export?name=${encodeURIComponent(presetName)}`);
         } else if (ctx.mode === 'plot') {
-            blob = await fetchExportBlob(`/download/plot/${ctx.tabId}`);
+            const view = exportViewStates([ctx.tabId])[String(ctx.tabId)] || {};
+            blob = await fetchExportBlob(`/download/plot/${ctx.tabId}?view=${encodeURIComponent(JSON.stringify(view))}`);
         } else if (ctx.mode === 'cycle') {
             blob = buildCycleAnalysisCsvBlob();
             if (!blob) throw new Error('Run Cycle Analysis before exporting.');
@@ -4532,12 +4668,90 @@ async function confirmExportDialog() {
     }
 }
 
+function plotViewStorageKey(tabId) {
+    return `signalworks_studio_plot_view_${DATASET_TOKEN || 'no-data'}_tab_${Number(tabId)}_${TAB_VIEW_TOKENS[tabId] || ''}`;
+}
+
+function readStoredPlotView(tabId) {
+    try {
+        const raw = sessionStorage.getItem(plotViewStorageKey(tabId));
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (_) { return null; }
+}
+
+function currentPlotViewState(plotDiv) {
+    if (!plotDiv?.layout) return null;
+    const axisRange = axis => {
+        if (!axis || !Array.isArray(axis.range) || axis.range.length !== 2) return null;
+        return [axis.range[0], axis.range[1]];
+    };
+    const visibleSignals = {};
+    (plotDiv.data || []).forEach(trace => {
+        if (!trace?.name) return;
+        visibleSignals[String(trace.name)] = trace.visible !== false && trace.visible !== 'legendonly';
+    });
+    return {
+        xaxis_range: axisRange(plotDiv.layout.xaxis),
+        yaxis_range: axisRange(plotDiv.layout.yaxis),
+        yaxis2_range: axisRange(plotDiv.layout.yaxis2),
+        dragmode: String(plotDiv.layout.dragmode || 'zoom'),
+        visible_signals: visibleSignals
+    };
+}
+
+function savePlotViewState(tabId=ACTIVE_TAB) {
+    const plotDiv = plotDivEl();
+    if (!interactiveViewReady || !plotDiv || Number(tabId) !== Number(ACTIVE_TAB)) return;
+    const state = currentPlotViewState(plotDiv);
+    if (!state) return;
+    try { sessionStorage.setItem(plotViewStorageKey(tabId), JSON.stringify(state)); } catch (_) {}
+}
+
+async function restorePlotViewState(plotDiv, tabId=ACTIVE_TAB) {
+    const state = readStoredPlotView(tabId);
+    if (!state || !plotDiv) return;
+    const relayout = {};
+    if (Array.isArray(state.xaxis_range) && state.xaxis_range.length === 2) {
+        relayout['xaxis.autorange'] = false; relayout['xaxis.range'] = state.xaxis_range;
+    }
+    if (Array.isArray(state.yaxis_range) && state.yaxis_range.length === 2) {
+        relayout['yaxis.autorange'] = false; relayout['yaxis.range'] = state.yaxis_range;
+    }
+    if (Array.isArray(state.yaxis2_range) && state.yaxis2_range.length === 2) {
+        relayout['yaxis2.autorange'] = false; relayout['yaxis2.range'] = state.yaxis2_range;
+    }
+    if (['zoom','pan'].includes(state.dragmode)) relayout.dragmode = state.dragmode;
+    if (Object.keys(relayout).length) await Plotly.relayout(plotDiv, relayout);
+    if (state.visible_signals && typeof state.visible_signals === 'object') {
+        const vis = (plotDiv.data || []).map(trace => state.visible_signals[String(trace.name)] === false ? 'legendonly' : true);
+        if (vis.length) await Plotly.restyle(plotDiv, {visible: vis});
+    }
+}
+
+function exportViewStates(tabIds) {
+    savePlotViewState(ACTIVE_TAB);
+    const out = {};
+    (tabIds || []).forEach(id => {
+        const state = readStoredPlotView(id);
+        if (state) out[String(id)] = state;
+    });
+    return out;
+}
+
+function setStaticPlotHref(link) {
+    const view = exportViewStates([ACTIVE_TAB])[String(ACTIVE_TAB)] || {};
+    link.href = `/plot/${ACTIVE_TAB}.png?view=${encodeURIComponent(JSON.stringify(view))}`;
+}
+
 function scheduleAnalysisUpdate() {
     clearTimeout(relayoutTimer);
     relayoutTimer = setTimeout(updateAnalysis, 120);
 }
 
 async function loadInteractivePlot() {
+    interactiveViewReady = false;
     const plotDiv = plotDivEl();
     if (!plotDiv) return;
     if (typeof Plotly === 'undefined') {
@@ -4575,6 +4789,8 @@ async function loadInteractivePlot() {
         engineeringShapeMap = JSON.parse(JSON.stringify(fig.layout?.meta?.signalworks_shape_map || fig.layout?.meta?.graphplot_shape_map || []));
         engineeringAnnotationMap = JSON.parse(JSON.stringify(fig.layout?.meta?.signalworks_annotation_map || fig.layout?.meta?.graphplot_annotation_map || []));
         await Plotly.relayout(plotDiv, plotThemeUpdate());
+        await restorePlotViewState(plotDiv, ACTIVE_TAB);
+        interactiveViewReady = true;
         requestAnimationFrame(() => {
             try { Plotly.Plots.resize(plotDiv); } catch (_) {}
         });
@@ -4590,10 +4806,10 @@ async function loadInteractivePlot() {
             }
             if (cursorMode) setCursor(cursorMode, pt.x);
         });
-        plotDiv.on('plotly_relayout', evt => { handleAnnotationRelayout(evt); scheduleAnalysisUpdate(); });
-        plotDiv.on('plotly_restyle', scheduleAnalysisUpdate);
-        plotDiv.on('plotly_legendclick', () => setTimeout(updateAnalysis, 80));
-        plotDiv.on('plotly_legenddoubleclick', () => setTimeout(updateAnalysis, 80));
+        plotDiv.on('plotly_relayout', evt => { handleAnnotationRelayout(evt); savePlotViewState(); scheduleAnalysisUpdate(); });
+        plotDiv.on('plotly_restyle', () => { savePlotViewState(); scheduleAnalysisUpdate(); });
+        plotDiv.on('plotly_legendclick', () => setTimeout(() => { savePlotViewState(); updateAnalysis(); }, 100));
+        plotDiv.on('plotly_legenddoubleclick', () => setTimeout(() => { savePlotViewState(); updateAnalysis(); }, 100));
         updateAnalysis();
     } catch (err) {
         plotDiv.innerHTML = `<div class="plot-error">Interactive plot error: ${String(err)}</div>`;
@@ -4894,7 +5110,7 @@ window.addEventListener('DOMContentLoaded', () => {
     startServerHeartbeat();
     loadInteractivePlot();
 });
-window.addEventListener('pagehide', () => { saveSidebarUiState(); releaseServerClient(); });
+window.addEventListener('pagehide', () => { savePlotViewState(); saveSidebarUiState(); releaseServerClient(); });
 """
 
 
@@ -4952,6 +5168,8 @@ def render_page(state: BrowserSession, active_tab: int) -> str:
         .replace('__REVISION__', str(state.tabs[active_tab].revision if has_data else 0))
         .replace('__EXPORT_BASE_JSON__', json.dumps(export_base, ensure_ascii=False))
         .replace('__PRESET_NAME_JSON__', json.dumps(state.preset_name or "Signal Preset", ensure_ascii=False))
+        .replace('__DATASET_TOKEN_JSON__', json.dumps(state.dataset_token or "no-data", ensure_ascii=False))
+        .replace('__TAB_VIEW_TOKENS_JSON__', json.dumps([tab.view_token for tab in state.tabs]))
     )
 
     return f"""<!doctype html>
@@ -4962,9 +5180,9 @@ def render_page(state: BrowserSession, active_tab: int) -> str:
     <title>{esc(APP_TITLE)} — {esc(APP_TAGLINE)}</title>
     <script>
     (() => {{
-        const key='signalworks_studio_theme_mode';
+        const key='signalworks_studio_theme_session_mode';
         let mode='system';
-        try {{ mode=localStorage.getItem(key)||'system'; }} catch (_) {{}}
+        try {{ mode=sessionStorage.getItem(key)||'system'; }} catch (_) {{}}
         const resolved=(mode==='dark'||mode==='light') ? mode : ((window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light');
         document.documentElement.dataset.themeMode=mode;
         document.documentElement.dataset.theme=resolved;
@@ -5652,6 +5870,8 @@ async def update_tab(request: Request, tab_id: int):
     ts = state.tabs[tab_id]
 
     try:
+        old_axes = (ts.left_min, ts.left_max, ts.left_step, ts.right_min, ts.right_max, ts.right_step,
+                    list(ts.selected_signals), dict(ts.axis_assignments))
         ts.title = _form_value(form, "title", ts.title)
         ts.auto_title = form.get("auto_title") is not None
         ts.x_label = _form_value(form, "x_label", ts.x_label)
@@ -5667,6 +5887,7 @@ async def update_tab(request: Request, tab_id: int):
         selected_signals: List[str] = []
         assignments: Dict[str, str] = dict(ts.axis_assignments)
         colors: Dict[str, str] = dict(ts.color_assignments)
+        line_styles: Dict[str, str] = dict(ts.line_style_assignments)
 
         for idx, signal in enumerate(state.numeric_cols):
             if form.get(f"selected_{idx}") is not None:
@@ -5681,14 +5902,25 @@ async def update_tab(request: Request, tab_id: int):
             else:
                 colors.pop(signal, None)
 
+            line_style = _form_value(form, f"line_style_{idx}", "auto").lower()
+            if line_style in SIGNAL_LINE_STYLES:
+                line_styles[signal] = line_style
+            else:
+                line_styles.pop(signal, None)
+
         ts.selected_signals = selected_signals
         ts.axis_assignments = assignments
         ts.color_assignments = colors
+        ts.line_style_assignments = line_styles
 
         # Validate by building a figure now. This catches bad range input before redirect.
         fig = build_figure(state, tab_id)
         plt.close(fig)
 
+        new_axes = (ts.left_min, ts.left_max, ts.left_step, ts.right_min, ts.right_max, ts.right_step,
+                    list(ts.selected_signals), dict(ts.axis_assignments))
+        if old_axes != new_axes:
+            ts.view_token = uuid.uuid4().hex[:16]
         ts.revision += 1
         state.plot_cache.pop(tab_id, None)
 
@@ -5724,7 +5956,9 @@ async def plot_png(request: Request, tab_id: int):
         return response_with_session_cookie(response, state, is_new)
 
     try:
-        image = render_plot_png(state, tab_id, dpi=150, use_cache=True)
+        raw_view = request.query_params.get("view")
+        view_state = _parse_export_view(raw_view) if raw_view is not None else None
+        image = render_plot_png(state, tab_id, dpi=150, use_cache=True, view_state=view_state)
         response = Response(content=image, media_type="image/png")
         response.headers["Cache-Control"] = "no-store, max-age=0"
     except Exception as exc:
@@ -5740,7 +5974,8 @@ async def download_plot(request: Request, tab_id: int):
         return response_with_session_cookie(response, state, is_new)
 
     try:
-        image = render_plot_png(state, tab_id, dpi=300, use_cache=False)
+        view_state = _parse_export_view(request.query_params.get("view"))
+        image = render_plot_png(state, tab_id, dpi=300, use_cache=False, view_state=view_state)
         base = os.path.splitext(state.filename)[0] or "plot"
         tab_title = state.tabs[tab_id].title.strip() or f"Plot_{tab_id + 1}"
         safe_title = "".join(c if (c.isalnum() or c in "-_ ") else "_" for c in tab_title).strip().replace(" ", "_")
@@ -5750,6 +5985,52 @@ async def download_plot(request: Request, tab_id: int):
     except Exception as exc:
         response = Response(content=f"Save plot error: {exc}", media_type="text/plain", status_code=500)
     return response_with_session_cookie(response, state, is_new)
+
+
+def _sanitize_export_view_state(value: object) -> dict:
+    # Keep only safe view fields sent by this browser for static export.
+    if not isinstance(value, dict):
+        return {}
+    out: dict = {}
+    for key in ("xaxis_range", "yaxis_range", "yaxis2_range"):
+        rng = value.get(key)
+        if isinstance(rng, list) and len(rng) == 2:
+            out[key] = [rng[0], rng[1]]
+    if str(value.get("dragmode", "")) in ("zoom", "pan"):
+        out["dragmode"] = str(value.get("dragmode"))
+    vis = value.get("visible_signals")
+    if isinstance(vis, dict):
+        out["visible_signals"] = {str(k)[:240]: bool(v) for k, v in list(vis.items())[:500]}
+    return out
+
+
+def _parse_export_view(raw: Optional[str]) -> dict:
+    if not raw or len(str(raw)) > 20000:
+        return {}
+    try:
+        return _sanitize_export_view_state(json.loads(str(raw)))
+    except Exception:
+        return {}
+
+
+def _parse_export_views(raw: Optional[str]) -> Dict[int, dict]:
+    if not raw or len(str(raw)) > 60000:
+        return {}
+    try:
+        payload = json.loads(str(raw))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: Dict[int, dict] = {}
+    for key, value in list(payload.items())[:len(TAB_PRESETS)]:
+        try:
+            tab_id = int(key)
+        except Exception:
+            continue
+        if 0 <= tab_id < len(TAB_PRESETS):
+            out[tab_id] = _sanitize_export_view_state(value)
+    return out
 
 
 def _parse_report_tab_ids(raw_tabs: str | None) -> List[int]:
@@ -5776,7 +6057,7 @@ def _report_tab_ids_from_request(request: Request) -> List[int]:
     return _parse_report_tab_ids(request.query_params.get("tabs"))
 
 
-def build_wide_pdf_bytes(state: BrowserSession, tab_ids: Optional[List[int]] = None) -> bytes:
+def build_wide_pdf_bytes(state: BrowserSession, tab_ids: Optional[List[int]] = None, view_states: Optional[Dict[int, dict]] = None) -> bytes:
     """Create a multi-page PDF using a custom page size larger than A4 landscape.
 
     Each plot tab remains on its own PDF page.  The default page size is
@@ -5793,6 +6074,7 @@ def build_wide_pdf_bytes(state: BrowserSession, tab_ids: Optional[List[int]] = N
                 tab_id,
                 report_header=True,
                 figsize=WIDE_REPORT_FIGSIZE_IN,
+                view_state=(view_states or {}).get(tab_id),
             )
             try:
                 # bbox_inches=None is intentional: preserve the exact custom PDF page size.
@@ -5814,7 +6096,8 @@ async def generate_pdf_report(request: Request):
         tab_ids = _report_tab_ids_from_request(request)
         if not tab_ids:
             raise ValueError("Select at least one report page/tab.")
-        pdf_bytes = build_wide_pdf_bytes(state, tab_ids)
+        view_states = _parse_export_views(request.query_params.get("views"))
+        pdf_bytes = build_wide_pdf_bytes(state, tab_ids, view_states=view_states)
         base = os.path.splitext(state.filename)[0] or "Nissan_OBC"
         filename = f"{base}_Test_Report_Wide.pdf"
         response = Response(content=pdf_bytes, media_type="application/pdf")
@@ -5838,9 +6121,10 @@ async def generate_pdf_report_a4(request: Request):
         tab_ids = _report_tab_ids_from_request(request)
         if not tab_ids:
             raise ValueError("Select at least one report page/tab.")
+        view_states = _parse_export_views(request.query_params.get("views"))
         with PdfPages(stream) as pdf:
             for tab_id in tab_ids:
-                fig = build_figure(state, tab_id, report_header=True)
+                fig = build_figure(state, tab_id, report_header=True, view_state=view_states.get(tab_id))
                 try:
                     pdf.savefig(fig, bbox_inches="tight", pad_inches=0.08)
                 finally:
@@ -5857,6 +6141,70 @@ async def generate_pdf_report_a4(request: Request):
     return response_with_session_cookie(response, state, is_new)
 
 
+def _png_pixel_size(png_bytes: bytes) -> Tuple[int, int]:
+    # Return PNG pixel dimensions using only the standard library.
+    if len(png_bytes) < 24 or png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+        return 1600, 900
+    try:
+        width, height = struct.unpack(">II", png_bytes[16:24])
+        return max(1, int(width)), max(1, int(height))
+    except Exception:
+        return 1600, 900
+
+
+def _build_builtin_docx(image_pages: List[bytes]) -> bytes:
+    # Minimal landscape DOCX: one rendered plot image per selected report page.
+    if not image_pages:
+        raise ValueError("No report pages were generated.")
+
+    relationships = []
+    paragraphs = []
+    media = []
+    max_width_emu = int(10.5 * 914400)
+    max_height_emu = int(6.65 * 914400)
+
+    for idx, image in enumerate(image_pages, start=1):
+        width_px, height_px = _png_pixel_size(image)
+        ratio = width_px / max(1.0, float(height_px))
+        cx = max_width_emu
+        cy = int(cx / max(0.01, ratio))
+        if cy > max_height_emu:
+            cy = max_height_emu
+            cx = int(cy * ratio)
+        rid = f"rId{idx}"
+        relationships.append(
+            f'<Relationship Id="{rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image{idx}.png"/>'
+        )
+        paragraphs.append(f"""<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:drawing>
+<wp:inline distT="0" distB="0" distL="0" distR="0">
+<wp:extent cx="{cx}" cy="{cy}"/><wp:effectExtent l="0" t="0" r="0" b="0"/>
+<wp:docPr id="{idx}" name="SignalWorks Studio Plot {idx}"/><wp:cNvGraphicFramePr/>
+<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+<pic:pic><pic:nvPicPr><pic:cNvPr id="0" name="image{idx}.png"/><pic:cNvPicPr/></pic:nvPicPr>
+<pic:blipFill><a:blip r:embed="{rid}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>
+<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr>
+</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>""")
+        if idx < len(image_pages):
+            paragraphs.append('<w:p><w:r><w:br w:type="page"/></w:r></w:p>')
+        media.append((f"word/media/image{idx}.png", image))
+
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>{''.join(paragraphs)}<w:sectPr><w:pgSz w:w="16834" w:h="11909" w:orient="landscape"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr></w:body></w:document>""".encode("utf-8")
+    rels_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{''.join(relationships)}</Relationships>""".encode("utf-8")
+    content_types = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"""
+    root_rels = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"""
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("word/document.xml", document_xml)
+        archive.writestr("word/_rels/document.xml.rels", rels_xml)
+        for name, image in media:
+            archive.writestr(name, image)
+    return output.getvalue()
+
+
 @app.get("/report/word")
 async def generate_word_report(request: Request):
     state, is_new = get_or_create_session(request)
@@ -5865,56 +6213,59 @@ async def generate_word_report(request: Request):
         return response_with_session_cookie(response, state, is_new)
 
     try:
-        import docx
-        from docx.enum.section import WD_ORIENT
-        from docx.shared import Inches
-    except ImportError:
-        response = Response(
-            content="Missing python-docx. Install with: pip install python-docx",
-            media_type="text/plain",
-            status_code=500,
-        )
-        return response_with_session_cookie(response, state, is_new)
-
-    try:
         tab_ids = _report_tab_ids_from_request(request)
         if not tab_ids:
             raise ValueError("Select at least one report page/tab.")
-        doc = docx.Document()
-        section = doc.sections[0]
-        section.orientation = WD_ORIENT.LANDSCAPE
-        section.page_width = Inches(11.69)
-        section.page_height = Inches(8.27)
-        section.left_margin = Inches(0.5)
-        section.right_margin = Inches(0.5)
-        section.top_margin = Inches(0.5)
-        section.bottom_margin = Inches(0.5)
+        view_states = _parse_export_views(request.query_params.get("views"))
 
-        for page_index, tab_id in enumerate(tab_ids):
-            if page_index > 0:
-                doc.add_page_break()
-
-            fig = build_figure(state, tab_id, report_header=True)
+        # Render once; both engines consume the same PNG pages.
+        page_images: List[bytes] = []
+        for tab_id in tab_ids:
+            fig = build_figure(state, tab_id, report_header=True, view_state=view_states.get(tab_id))
             image_stream = io.BytesIO()
             try:
                 fig.savefig(image_stream, format="png", dpi=200, bbox_inches="tight", pad_inches=0.08)
             finally:
                 plt.close(fig)
-            image_stream.seek(0)
-            doc.add_picture(image_stream, width=Inches(10.5))
+            page_images.append(image_stream.getvalue())
 
-        output = io.BytesIO()
-        doc.save(output)
-        output.seek(0)
+        used_builtin_fallback = False
+        try:
+            import docx
+            from docx.enum.section import WD_ORIENT
+            from docx.shared import Inches
+        except ImportError:
+            used_builtin_fallback = True
+            docx_bytes = _build_builtin_docx(page_images)
+        else:
+            doc = docx.Document()
+            section = doc.sections[0]
+            section.orientation = WD_ORIENT.LANDSCAPE
+            section.page_width = Inches(11.69)
+            section.page_height = Inches(8.27)
+            section.left_margin = Inches(0.5)
+            section.right_margin = Inches(0.5)
+            section.top_margin = Inches(0.5)
+            section.bottom_margin = Inches(0.5)
 
-        base = os.path.splitext(state.filename)[0] or "Nissan_OBC"
+            for page_index, image in enumerate(page_images):
+                if page_index > 0:
+                    doc.add_page_break()
+                doc.add_picture(io.BytesIO(image), width=Inches(10.5))
+
+            output = io.BytesIO()
+            doc.save(output)
+            docx_bytes = output.getvalue()
+
+        base = os.path.splitext(state.filename)[0] or "SignalWorksStudio"
         filename = f"{base}_Test_Report.docx"
         response = Response(
-            content=output.getvalue(),
+            content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
         response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
-        state.status = f"Word Report generated successfully ({len(tab_ids)} selected page(s))."
+        engine_note = " · built-in DOCX fallback" if used_builtin_fallback else ""
+        state.status = f"Word Report generated successfully ({len(tab_ids)} selected page(s)){engine_note}."
         state.status_type = "success"
     except Exception as exc:
         response = Response(content=f"Word generation error: {exc}", media_type="text/plain", status_code=500)

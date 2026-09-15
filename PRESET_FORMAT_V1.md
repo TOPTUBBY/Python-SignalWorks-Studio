@@ -96,3 +96,7 @@ When imported, SignalWorks Studio matches signal names against the current CSV. 
 ## Backward compatibility
 
 SignalWorks Studio V4.4.5 imports the current `SignalWorksStudioPreset` format and also accepts legacy `GraphPlotSignalPreset` and `CSVDataPlotterPreset` V1 files. Existing presets therefore remain usable after the branding change.
+
+## Signal line style (optional)
+
+Signal entries may include `line_style`: `auto`, `solid`, `dash`, `dot`, `dashdot` or `longdash`. Missing/auto preserves the existing Primary solid / Secondary patterned defaults. Older V1 presets remain compatible. Browser zoom, pan and hidden-signal state are session view settings and are not stored in portable presets.

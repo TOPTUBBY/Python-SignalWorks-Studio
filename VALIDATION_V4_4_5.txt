@@ -1,19 +1,45 @@
-SignalWorks Studio V4.4.5 Validation
+SignalWorks Studio V4.4.5.2026 - issue hotfix validation (2026-09-15)
 
 Main source: SignalWorks_Studio_webserv_v4_4_5.py
-Default port: 8800
-Python compile: PASS
-Embedded JavaScript syntax: PASS
-Light/Dark toggle: PASS
-System option removed: PASS
-Fresh browser session follows OS/browser theme: PASS
-Session-only manual override: PASS
-Full launcher package retained: PASS
-lib_install.bat retained: PASS
+Default Local/LAN port: 8800 (unchanged)
+Base commit: aa35a4929154bdf2565fd82bbe834612e7eede3e
 
-Branding validation:
-- Product name: SignalWorks Studio
-- Web brand mark: inline signal-wave SVG
-- Browser title / health identity: SignalWorks Studio
-- Legacy preset formats remain import-compatible
-- Legacy GraphPlot server process detection retained for safe migration
+Executed locally on Linux:
+Python 3.12; pandas 2.2.3; NumPy 2.3.5; Matplotlib 3.10.8;
+Plotly 5.18.0; FastAPI 0.141.1; python-docx 1.2.0; Node.js.
+
+PASS - Python compile (main source and launcher).
+PASS - Embedded JavaScript syntax in rendered HTML.
+PASS - 11 Python/API regression tests (python -m unittest discover -s tests -v).
+PASS - JavaScript view-state tests (node tests/test_view_state.cjs).
+PASS - git diff --check.
+
+Verified regression:
+- Baseline parses 01.09.2026 23:59:59 -> 02.09.2026 00:00:01 as Jan 9 -> Feb 9
+  (2,592,002 seconds); fixed source reads Sep 1 -> Sep 2 (2 seconds).
+- Month rollover, mixed whole/fractional seconds, invalid rows, Date + Time,
+  existing slash/ISO timestamps.
+- Per-signal line styles in Plotly/Matplotlib and old/new V1 presets.
+- Three signal rows in static legends; rendered 16 long signal names with
+  Primary/Secondary legend boxes not overlapping. Static PNG visually reviewed.
+- PNG (inline and download), Wide/A4 PDF and Word endpoints return real files
+  and forward the saved ranges/visibility for the selected plot pages.
+- Custom-view PNG does not contaminate the default image cache.
+- DOCX fallback exercised with python-docx imports blocked; ZIP/XML validated
+  and the resulting two-image document reopened with python-docx.
+- View-state save/restore, per-tab/dataset isolation, axis reset invalidation,
+  hidden traces, autoscale extent, loading guard and Static PNG URL tested.
+- Branding, V4.4.5.2026 and port 8800 retained.
+
+Not verified in this environment:
+- Live browser UI interactions / Dark mode / native interactive legend geometry:
+  Chromium download timed out; connected browser blocked localhost with
+  net::ERR_BLOCKED_BY_CLIENT. JavaScript tests use a mocked Plotly/storage surface,
+  not a real browser rendering engine.
+- Windows BAT/VBS execution, LAN/firewall access and Microsoft Word page layout.
+- pandas 1.5 runtime compatibility (parser uses explicit formats available in 1.5,
+  but executed tests used pandas 2.2.3).
+
+The previous failing self-patching workflow is replaced by a read-only regression
+workflow. Local results above do not imply that GitHub Actions has completed.
+Open issues remain available for user acceptance testing.

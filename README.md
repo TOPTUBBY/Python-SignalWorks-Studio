@@ -39,6 +39,32 @@
 
 ---
 
+## V4.4.5.2026 issue fixes — 2026-09-15
+
+This hotfix retains **V4.4.5.2026**, the existing source filename and **port 8800**.
+
+- **Dates:** dotted logger timestamps `dd.MM.yyyy HH:mm:ss` (also `_` before time and fractional seconds) are read day-first, including month rollover and separate Date/Time columns.
+- **Legends:** up to three signal rows, with additional columns; static legend text scales down when long names would overlap.
+- **Plot views:** each plot page remembers its zoom, pan mode and hidden signals within the browser session. A new dataset, preset, reset, or changed signal/axis range settings starts a fresh view. Color, line style and title changes retain the view.
+- **Exports:** Static PNG, Save PNG, Wide PDF, A4 PDF and Word use the saved axis ranges and signal visibility for the selected pages. Unvisited pages use their configured defaults. Static reports keep the existing report styling.
+- **Line styles:** select Auto, Solid, Dash, Dot, Dash-dot or Long dash per signal, then **Apply & Refresh Plot**. V1 presets save the optional `line_style`; older presets remain compatible.
+- **Dark mode:** lighter surfaces, controls, borders and graph grid. The two-state Light/Dark switch keeps a session-only override; new sessions follow the OS/browser theme.
+- **Word:** a built-in DOCX writer generates image-based reports if `python-docx` is missing. `lib_install.bat` / `requirements.txt` still install the normal full dependency set.
+
+**ภาษาไทย:** รุ่นแก้ไขนี้ยังเป็น V4.4.5.2026 / port 8800 แก้วันที่แบบจุดสลับวันกับเดือน จดจำ zoom/pan และสัญญาณที่ซ่อนแยกแต่ละหน้า และนำมุมมองนั้นไปใช้กับ PNG/PDF/Word เพิ่มการเลือกชนิดเส้น ปรับ Dark mode ให้อ่านง่ายขึ้น และสร้าง Word ได้แม้ไม่มี `python-docx` หลังเปลี่ยนข้อมูล/preset หรือปรับช่วงแกน ให้เริ่มมุมมองใหม่เพื่อใช้ค่าที่ตั้งล่าสุด
+
+### Regression checks
+
+```bash
+python -m pip install -r requirements.txt httpx
+python -m unittest discover -s tests -v
+node tests/test_view_state.cjs
+```
+
+See `VALIDATION_V4_4_5.txt` for the tested environment, coverage and platform limitations.
+
+---
+
 ## 🔄 Branding / การเปลี่ยนชื่อ
 
 The project is now branded **SignalWorks Studio**. The analysis engine remains on the validated **V4.4.5.2026** baseline. Existing legacy `GraphPlotSignalPreset` / `CSVDataPlotterPreset` V1 files remain import-compatible.

@@ -1,5 +1,21 @@
 # SignalWorks Studio Version History
 
+## V4.4.5.2026 issue hotfix — 2026-09-15
+
+Addresses #1 (graphics, view/export behavior) and #2 (timestamp interpretation). Retains the V4.4.5.2026 baseline and port 8800.
+
+- Applied and reviewed the pending source patch from the failed temporary workflow; fixes now live directly in the source.
+- Parse dotted day-first timestamps explicitly, including fractional seconds and Date + Time columns, without relying on pandas 2.x mixed-format inference.
+- Keep legends to three signal rows, disable vertical Plotly legend grouping and fit static legend text to prevent overlap.
+- Preserve per-page zoom/pan and trace visibility; invalidate stale views on dataset/preset/reset or axis/signal changes.
+- Send saved view ranges and visibility to Static PNG, downloaded PNG, Wide/A4 PDF and Word exports; bypass the default PNG cache for custom views.
+- Add per-signal line styles with backward-compatible V1 preset import/export.
+- Lighten Dark mode surfaces and fix the initial theme script to use session storage consistently.
+- Generate a valid image-based DOCX with the standard library when python-docx is unavailable.
+- Add executable regression tests and record validation scope in VALIDATION_V4_4_5.txt.
+
+---
+
 ## Branding refresh — 2026-09-08
 
 The V4.4.5 production baseline is now branded **SignalWorks Studio**. The application core, CSV binding logic, plotting behavior, Cycle Analysis and report workflow remain on the validated V4.4.5 code line.
