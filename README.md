@@ -53,6 +53,12 @@ This hotfix retains **V4.4.5.2026**, the existing source filename and **port 880
 
 **ภาษาไทย:** รุ่นแก้ไขนี้ยังเป็น V4.4.5.2026 / port 8800 แก้วันที่แบบจุดสลับวันกับเดือน จดจำ zoom/pan และสัญญาณที่ซ่อนแยกแต่ละหน้า และนำมุมมองนั้นไปใช้กับ PNG/PDF/Word เพิ่มการเลือกชนิดเส้น ปรับ Dark mode ให้อ่านง่ายขึ้น และสร้าง Word ได้แม้ไม่มี `python-docx` หลังเปลี่ยนข้อมูล/preset หรือปรับช่วงแกน ให้เริ่มมุมมองใหม่เพื่อใช้ค่าที่ตั้งล่าสุด
 
+### GUI follow-up — 2026-09-15
+
+- **Data Series:** each signal name uses the full row width and wraps when needed. Compact axis, line-style and color controls sit underneath the name.
+- **GUI legends:** Primary and Secondary have independent Plotly legend boxes below the graph, each with at most three signal rows. Extra vertical space preserves the plotting area when both axes are used. Single-axis pages show the corresponding heading.
+- **ภาษาไทย:** ชื่อสัญญาณแสดงเต็มความกว้างและขึ้นบรรทัดใหม่ได้ ตัวเลือกแกน/เส้น/สีอยู่ด้านล่าง ส่วน GUI แยกกล่อง Primary และ Secondary ให้เห็นหัวข้อครบ โดยเพิ่มพื้นที่ legend เมื่อใช้สองแกน
+
 ### Regression checks
 
 ```bash
@@ -60,6 +66,8 @@ python -m pip install -r requirements.txt httpx
 python -m unittest discover -s tests -v
 node tests/test_view_state.cjs
 ```
+
+GitHub Actions also runs `tests/test_browser.cjs` in Chromium and saves screenshots of synthetic test data. For local browser tests, install Playwright and Chromium (`npm install --no-save playwright`, `npx playwright install chromium`), then run `node tests/test_browser.cjs` with port 8800 free.
 
 See `VALIDATION_V4_4_5.txt` for the tested environment, coverage and platform limitations.
 

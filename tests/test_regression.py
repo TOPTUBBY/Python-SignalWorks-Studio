@@ -88,6 +88,19 @@ class Regression(unittest.TestCase):
         for n in [1,3,4,7,10,16,40,100]:
             self.assertLessEqual(math.ceil(n/sw.compact_legend_ncol(n)),3)
 
+    def test_gui_legends_use_separate_axis_containers(self):
+        fig = self.client.get('/api/plot/0').json()
+        self.assertEqual([(t['name'],t['legend']) for t in fig['data']],
+                         [('Temp','legend'),('Voltage','legend2')])
+        self.assertEqual(fig['layout']['legend']['title']['text'],'PRIMARY')
+        self.assertEqual(fig['layout']['legend2']['title']['text'],'SECONDARY')
+        self.assertTrue(fig['layout']['showlegend'])
+        self.assertTrue(all('legendgrouptitle' not in t for t in fig['data']))
+        self.client.post('/update/0', data={'selected_1':'on','axis_1':'right'})
+        fig = self.client.get('/api/plot/0').json()
+        self.assertEqual(fig['data'][0]['legend'],'legend2')
+        self.assertEqual(fig['layout']['legend2']['title']['text'],'SECONDARY')
+
     def test_long_legends_do_not_overlap(self):
         self.state.df = pd.DataFrame({f'Long_Signal_Name_{i}':[i,i+1,i+2] for i in range(16)})
         tab = self.state.tabs[0]

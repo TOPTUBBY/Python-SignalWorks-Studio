@@ -31,3 +31,6 @@ SignalWorks_Studio_launcher.log
 *.tmp
 *.bak
 *~
+
+# Synthetic browser regression screenshots
+tests/browser-artifacts/

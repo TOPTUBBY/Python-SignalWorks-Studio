@@ -43,3 +43,14 @@ Not verified in this environment:
 The previous failing self-patching workflow is replaced by a read-only regression
 workflow. Local results above do not imply that GitHub Actions has completed.
 Open issues remain available for user acceptance testing.
+
+GUI follow-up (2026-09-15):
+- Local Python/API suite: 12 tests, including independent legend containers and
+  a Secondary-only plot. Existing export/preset/date regressions retained.
+- Node view-state tests and source/embedded JavaScript syntax checks retained.
+- tests/test_browser.cjs adds live Chromium coverage in GitHub Actions for both
+  axis headings, maximum three legend rows, legend clipping/overlap, full-width
+  names, compact viewport, themes, view restore and a Secondary-only page.
+- Browser screenshots use synthetic data and are stored as CI artifacts.
+  Consult the GitHub Actions run for execution results; the earlier local-browser
+  access limitation above still applies.

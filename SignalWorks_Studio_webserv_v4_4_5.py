@@ -2409,8 +2409,6 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
     fig = go.Figure()
     primary_index = 0
     secondary_index = 0
-    primary_group_title_added = False
-    secondary_group_title_added = False
     for header, series, axis_target in plot_items:
         y_vals = [None if pd.isna(v) else float(v) for v in series]
 
@@ -2424,14 +2422,10 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
                 name=header,
                 yaxis="y2",
                 legendgroup="secondary",
-                legendgrouptitle=(
-                    {"text": "SECONDARY"}
-                    if not secondary_group_title_added else None
-                ),
+                legend="legend2",
                 line={"color": color, "width": 1.8, "dash": dash},
                 hovertemplate="%{x}<br>" + header + ": %{y:.4g}<extra>Secondary</extra>",
             ))
-            secondary_group_title_added = True
             secondary_index += 1
         else:
             color = _effective_signal_color(ts, header, axis_target, primary_index, secondary_index)
@@ -2443,14 +2437,10 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
                 name=header,
                 yaxis="y",
                 legendgroup="primary",
-                legendgrouptitle=(
-                    {"text": "PRIMARY"}
-                    if not primary_group_title_added else None
-                ),
+                legend="legend",
                 line={"color": color, "width": 1.8, "dash": dash},
                 hovertemplate="%{x}<br>" + header + ": %{y:.4g}<extra>Primary</extra>",
             ))
-            primary_group_title_added = True
             primary_index += 1
 
     left_min = _safe_float(ts.left_min, "Left Y Min")
@@ -2600,9 +2590,20 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
         engineering_annotations.append(comment_ann)
         engineering_annotation_map.append({"kind": "comment", "id": str(comment.get("id", ""))})
 
-    # Keep the horizontal legend to at most three rows by adding columns as needed.
-    legend_columns = max(1, int(math.ceil(max(1, len(plot_items)) / 3.0)))
-    legend_entry_fraction = 1.0 / legend_columns
+    # Independent legends preserve both axis headings with normal trace ordering.
+    # Stacked full-width boxes avoid squeezing long names into half the plot width.
+    dual_legend = primary_index > 0 and secondary_index > 0
+    def axis_legend(title, count, color, y):
+        return dict(
+            title={"text": title, "side": "top", "font": {"color": color}},
+            orientation="h", traceorder="normal", yanchor="top", yref="container",
+            y=y, xanchor="left", x=0.0, groupclick="toggleitem",
+            font={"size": 11}, bgcolor="rgba(255,255,255,0.88)",
+            bordercolor=color, borderwidth=1,
+            entrywidthmode="fraction",
+            # Leave room for legend borders/padding so the last column fits.
+            entrywidth=0.98 / compact_legend_ncol(count),
+        )
 
     fig.update_layout(
         title={"text": title_text, "x": 0.5, "xanchor": "center", "font": {"size": 18}},
@@ -2611,27 +2612,14 @@ def build_interactive_figure(state: BrowserSession, tab_id: int):
         yaxis2=yaxis2,
         template="plotly_white",
         autosize=True,
-        margin={"l": 72, "r": 82, "t": 62, "b": 145},
+        margin={"l": 72, "r": 82, "t": 62, "b": 240 if dual_legend else 145},
         hovermode="x unified",
         hoverdistance=-1,
         spikedistance=-1,
         dragmode="zoom",
-        legend={
-            "orientation": "h",
-            "traceorder": "normal",
-            "yanchor": "top",
-            "y": -0.20,
-            "xanchor": "left",
-            "x": 0.0,
-            "groupclick": "toggleitem",
-            "tracegroupgap": 16,
-            "font": {"size": 11},
-            "bgcolor": "rgba(255,255,255,0.88)",
-            "bordercolor": "#e5e7eb",
-            "borderwidth": 1,
-            "entrywidthmode": "fraction",
-            "entrywidth": legend_entry_fraction,
-        },
+        showlegend=True,
+        legend=axis_legend("PRIMARY", primary_index, PRIMARY_AXIS_COLOR, 0.26 if dual_legend else 0.15),
+        legend2=axis_legend("SECONDARY", secondary_index, SECONDARY_AXIS_COLOR, 0.13 if dual_legend else 0.15),
         shapes=engineering_shapes,
         annotations=engineering_annotations,
         meta={
@@ -2741,11 +2729,11 @@ def render_signal_rows(state: BrowserSession, tab_id: int) -> str:
                     <span class="signal-name">{esc(signal)}</span>
                     <span class="preset-badge {'show' if preset_marker == '1' else ''}" title="Signal is defined in the active preset">P</span>
                 </label>
-                <select name="axis_{idx}" class="axis-select" onchange="updateSignalRowClass(this); refreshAutoColorForRow(this)">
+                <select name="axis_{idx}" class="axis-select" title="Signal axis" aria-label="Axis for {esc(signal)}" onchange="updateSignalRowClass(this); refreshAutoColorForRow(this)">
                     <option value="left" {left_selected}>Primary</option>
                     <option value="right" {right_selected}>Secondary</option>
                 </select>
-                <select name="line_style_{idx}" class="line-style-select" title="Signal line style. Auto keeps the default style for the selected axis.">{line_style_html}</select>
+                <select name="line_style_{idx}" class="line-style-select" aria-label="Line style for {esc(signal)}" title="Signal line style. Auto keeps the default style for the selected axis.">{line_style_html}</select>
                 <div class="color-control{auto_class}" title="Signal color. Click the color to set manually, or A to return to automatic color.">
                     <input type="hidden" class="color-mode" name="color_mode_{idx}" value="{color_mode}">
                     <input type="color" class="signal-color" name="color_{idx}" value="{esc(shown_color)}" data-auto-primary="{PRIMARY_LINE_COLORS[idx % len(PRIMARY_LINE_COLORS)]}" data-auto-secondary="{SECONDARY_LINE_COLORS[idx % len(SECONDARY_LINE_COLORS)]}" oninput="setManualColor(this)">
@@ -2861,6 +2849,7 @@ def render_active_tab(state: BrowserSession, tab_id: int) -> str:
         if ts.axis_assignments.get(sig, default_axis_for_signal(tab_id, sig)) == "left"
     )
     right_count = selected_count - left_count
+    dual_legend_class = " dual-legend" if left_count and right_count else ""
 
     signal_rows = render_signal_rows(state, tab_id)
     image_src = f"/plot/{tab_id}.png?v={ts.revision}"
@@ -2990,7 +2979,7 @@ def render_active_tab(state: BrowserSession, tab_id: int) -> str:
                         <a class="btn compact" href="{image_src}" target="_blank" onclick="setStaticPlotHref(this)">Static PNG</a>
                     </div>
                 </div>
-                <div class="interactive-plot-wrap">
+                <div class="interactive-plot-wrap{dual_legend_class}">
                     <div id="interactivePlot" class="interactive-plot">
                         <div class="plot-loading"><span class="spinner"></span>Loading graph...</div>
                     </div>
@@ -3348,23 +3337,26 @@ details.collapsible[open] summary::after { transform:rotate(180deg); }
 .secondary-text-btn { color:var(--secondary-axis); }
 .signal-list { border:1px solid var(--line); border-radius:9px; max-height:min(390px,42vh); overflow-y:auto; overscroll-behavior:auto; background:#fff; }
 .signal-row {
-    display:grid; grid-template-columns:minmax(0,1fr) 96px 88px 58px; gap:6px; align-items:center;
-    min-height:36px; padding:5px 7px; border-bottom:1px solid #f0f1f3; border-left:2px solid transparent;
+    display:grid; grid-template-columns:minmax(0,1fr) 86px 80px 54px; gap:4px 6px; align-items:center;
+    min-height:54px; padding:6px 7px; border-bottom:1px solid #f0f1f3; border-left:2px solid transparent;
 }
 .signal-row:last-child { border-bottom:0; }
 .signal-row:hover { background:#f9fafb; }
 .primary-row { border-left-color:var(--primary-axis); }
 .secondary-row { border-left-color:var(--secondary-axis); }
-.signal-check { display:flex; align-items:center; gap:6px; font-size:11px; min-width:0; cursor:pointer; }
-.signal-check input { flex:0 0 auto; margin:0; }
+.signal-check { grid-column:1 / -1; display:flex; align-items:flex-start; gap:6px; font-size:12px; min-width:0; cursor:pointer; }
+.signal-check input { flex:0 0 auto; margin:2px 0 0; }
 .signal-name {
-    display:block; min-width:0; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis;
-    white-space:nowrap; color:#344054; font-weight:500;
+    display:block; min-width:0; flex:1 1 auto; overflow-wrap:anywhere;
+    white-space:normal; line-height:1.4; color:#344054; font-weight:600;
 }
 .signal-row:hover .signal-name { color:#101828; }
-.axis-select, .line-style-select { padding:5px 6px; border-radius:6px; font-size:10px; min-width:0; }
+.signal-row > .axis-select { grid-column:2; }
+.signal-row > .line-style-select { grid-column:3; }
+.signal-row > .color-control { grid-column:4; }
+.axis-select, .line-style-select { width:100%; padding:3px 4px; border-radius:6px; font-size:10px; min-width:0; }
 .color-control { display:flex; align-items:center; gap:3px; justify-content:flex-end; }
-.signal-color { width:30px; height:25px; padding:1px; border:1px solid var(--line-strong); border-radius:6px; background:#fff; cursor:pointer; }
+.signal-color { width:27px; height:23px; padding:1px; border:1px solid var(--line-strong); border-radius:6px; background:#fff; cursor:pointer; }
 .color-control.auto .signal-color { opacity:.72; }
 .auto-color-btn { width:22px; height:24px; padding:0; border:1px solid var(--line); border-radius:6px; background:#fff; color:#667085; font-size:9px; font-weight:700; cursor:pointer; }
 .auto-color-btn:hover { background:#f2f4f7; color:#344054; }
@@ -3382,6 +3374,7 @@ details.collapsible[open] summary::after { transform:rotate(180deg); }
 .toolbar-help { color:var(--muted); font-size:10px; margin-top:3px; }
 .toolbar-actions, .cursor-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
 .interactive-plot-wrap { width:100%; height:clamp(520px, 64vh, 720px); background:#fff; overflow:hidden; }
+.interactive-plot-wrap.dual-legend { height:calc(clamp(520px, 64vh, 720px) + 95px); }
 .interactive-plot { width:100%; height:100%; min-height:0; }
 .plot-loading { width:100%; height:100%; display:flex; align-items:center; justify-content:center; gap:9px; color:var(--muted); font-size:12px; }
 .spinner { width:15px; height:15px; border:2px solid #e4e7ec; border-top-color:#667085; border-radius:50%; animation:spin .8s linear infinite; }
@@ -3699,7 +3692,7 @@ html[data-theme="dark"] .comment-add-btn { background:#172f46 !important; color:
     .report-actions .btn { flex:1; }
     .header-menu { width:auto; }
     .menu-panel, .menu-panel.wide { min-width:min(310px, calc(100vw - 28px)); }
-    .signal-row { grid-template-columns:minmax(0,1fr) 82px 82px 52px; }
+    .signal-row { grid-template-columns:minmax(0,1fr) 86px 80px 54px; }
     .preset-badge { display:none !important; }
     .analysis-metrics { grid-template-columns:1fr; }
     .cycle-metrics { grid-template-columns:1fr 1fr; }
@@ -4017,8 +4010,25 @@ function plotThemeUpdate() {
         'xaxis.zerolinecolor': dark ? '#586575' : '#c8ced6', 'xaxis.spikecolor': dark ? '#aeb8c5' : '#8b95a1',
         'yaxis.gridcolor': dark ? '#46515f' : '#dfe4ea', 'yaxis.zerolinecolor': dark ? '#586575' : '#c8ced6',
         'legend.bgcolor': dark ? 'rgba(41,50,61,0.94)' : 'rgba(255,255,255,0.88)',
-        'legend.bordercolor': dark ? '#526071' : '#e5e7eb'
+        'legend.bordercolor': dark ? '#79c3ef' : '#1f5a99',
+        'legend2.bgcolor': dark ? 'rgba(41,50,61,0.94)' : 'rgba(255,255,255,0.88)',
+        'legend2.bordercolor': dark ? '#ff9484' : '#c43c20',
+        'legend.title.font.color': dark ? '#79c3ef' : '#1f5a99',
+        'legend2.title.font.color': dark ? '#ff9484' : '#c43c20'
     };
+}
+function positionAxisLegends(plotDiv) {
+    if (!plotDiv?.data || !plotDiv.clientHeight) return;
+    const hasPrimary = plotDiv.data.some(trace => trace.legend !== 'legend2');
+    const hasSecondary = plotDiv.data.some(trace => trace.legend === 'legend2');
+    const dual = hasPrimary && hasSecondary;
+    plotDiv.parentElement?.classList.toggle('dual-legend', dual);
+    const height = plotDiv.clientHeight;
+    return Plotly.relayout(plotDiv, {
+        'legend.y': (dual ? 190 : 95) / height,
+        'legend2.y': 95 / height,
+        'margin.b': dual ? 240 : 145
+    });
 }
 function applyThemeToPlot() {
     const plotDiv = plotDivEl();
@@ -4789,6 +4799,7 @@ async function loadInteractivePlot() {
         engineeringShapeMap = JSON.parse(JSON.stringify(fig.layout?.meta?.signalworks_shape_map || fig.layout?.meta?.graphplot_shape_map || []));
         engineeringAnnotationMap = JSON.parse(JSON.stringify(fig.layout?.meta?.signalworks_annotation_map || fig.layout?.meta?.graphplot_annotation_map || []));
         await Plotly.relayout(plotDiv, plotThemeUpdate());
+        await positionAxisLegends(plotDiv);
         await restorePlotViewState(plotDiv, ACTIVE_TAB);
         interactiveViewReady = true;
         requestAnimationFrame(() => {
@@ -5109,6 +5120,9 @@ window.addEventListener('DOMContentLoaded', () => {
     setThemeMode(currentThemeMode(), false);
     startServerHeartbeat();
     loadInteractivePlot();
+});
+window.addEventListener('resize', () => {
+    if (interactiveViewReady) positionAxisLegends(plotDivEl());
 });
 window.addEventListener('pagehide', () => { savePlotViewState(); saveSidebarUiState(); releaseServerClient(); });
 """

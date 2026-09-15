@@ -1,5 +1,15 @@
 # SignalWorks Studio Version History
 
+## V4.4.5.2026 GUI follow-up — 2026-09-15
+
+- Give Data Series names the full row width, allow wrapping and place smaller axis/line/color controls on the next row.
+- Fix the missing Secondary GUI heading: route traces to independent `legend` / `legend2` containers with explicit Primary / Secondary titles instead of grouped titles in one legend.
+- Reserve space for both legend boxes without reducing the graph area; support single-axis pages and style both legends in Dark mode.
+- Add an API regression for legend routing and a Chromium regression for legend geometry, readable names, responsive controls and saved zoom/visibility. CI uploads synthetic screenshots.
+- Keep V4.4.5.2026, port 8800 and the existing static PNG/report rendering.
+
+---
+
 ## V4.4.5.2026 issue hotfix — 2026-09-15
 
 Addresses #1 (graphics, view/export behavior) and #2 (timestamp interpretation). Retains the V4.4.5.2026 baseline and port 8800.
