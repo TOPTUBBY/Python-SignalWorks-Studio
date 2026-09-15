@@ -33,8 +33,9 @@ let browser;
   await page.waitForFunction(()=>typeof interactiveViewReady!=='undefined' && interactiveViewReady);
  }
  await open();
+ await page.screenshot({path:path.join(output,'initial-layout.png'),fullPage:true});
  assert.equal(await page.locator('.legend .legendtitletext').textContent(),'PRIMARY');
- assert.equal(await page.locator('.legend2 .legendtitletext').textContent(),'SECONDARY');
+ assert.equal(await page.locator('.legend2 .legend2titletext').textContent(),'SECONDARY');
  const geometry=await page.evaluate(()=>{
   const box=e=>{const r=e.getBoundingClientRect();return {x:r.x,y:r.y,w:r.width,h:r.height,bottom:r.bottom};};
   return {legends:['.legend','.legend2'].map(selector=>({box:box(document.querySelector(selector)),
@@ -73,7 +74,7 @@ let browser;
  // A Secondary-only page must display its heading even with a single signal.
  await context.request.post('http://127.0.0.1:8800/update/1',{form:{selected_8:'on',axis_8:'right'}});
  await open(1);
- assert.equal(await page.locator('.legend2 .legendtitletext').textContent(),'SECONDARY');
+ assert.equal(await page.locator('.legend2 .legend2titletext').textContent(),'SECONDARY');
  assert.equal(await page.locator('.legend2 .legendtext').textContent(),names[8]);
  assert.deepEqual(errors,[]);
  console.log('PASS: browser legend routing/rows/geometry, full signal names, responsive controls, theme, zoom/visibility restoration and Secondary-only page');
